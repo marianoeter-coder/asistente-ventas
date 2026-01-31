@@ -1,22 +1,22 @@
 # app.py — Asistente de Ventas Big Dipper (conversacional, detecta modelos/URLs, trae ficha oficial y responde “modo vendedor”)
-# Reqs: streamlit, google-generativeai, requests, beautifulsoup4 (opcional), pypdf
+# Reqs: streamlit, google-generativeai, requests, beautifulsoup4, pypdf
 
 import re
 import json
-import time
 from typing import Dict, Any, List, Optional, Tuple
 
 import streamlit as st
 import requests
+from bs4 import BeautifulSoup
 
-# Gemini (opcional: si no hay key, cae a modo “reglas + ficha”)
+# Gemini (opcional)
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
 except Exception:
     GEMINI_AVAILABLE = False
 
-# PDF (opcional, no rompe si falla)
+# PDF (opcional)
 try:
     from pypdf import PdfReader
     import io
@@ -30,30 +30,36 @@ except Exception:
 # =========================
 st.set_page_config(page_title="Asistente de Ventas Big Dipper", page_icon="🤖", layout="centered")
 
-# API (probado por tu captura: /api/Products/View con POST)
 API_BASES = [
     "https://www2.bigdipper.com.ar/api",
     "https://www.bigdipper.com.ar/api",
 ]
 
-# Timeouts
-HTTP_TIMEOUT = 8
+WEB_BASES = [
+    "https://www.bigdipper.com.ar",
+    "https://www2.bigdipper.com.ar",
+]
 
-# Límite de texto a extraer de PDF (para no explotar tokens)
-PDF_MAX_PAGES = 3
-PDF_MAX_CHARS = 3500
+HTTP_TIMEOUT = 10
 
-# Regex para detectar:
+PDF_MAX_PAGES = 2
+PDF_MAX_CHARS = 3000
+
+# Detecta URL de producto con ID
 RE_PRODUCT_URL_ID = re.compile(r"(?:bigdipper\.com\.ar\/products\/view\/)(\d+)", re.IGNORECASE)
-RE_ANY_ID = re.compile(r"\b(\d{3,8})\b")  # IDs plausibles
-RE_MODEL = re.compile(r"\b[A-Z0-9]{3,}(?:-[A-Z0-9]+)+\b", re.IGNORECASE)
+
+# Detecta modelo tipo IPC-4M-FA-ZERO / DS-PDBG8-EG2 / etc
+# Más permisivo: permite letras/números y guiones, exige al menos 2 guiones.
+RE_MODEL = re.compile(r"\b[A-Z0-9]{2,}(?:-[A-Z0-9]{2,}){2,}\b", re.IGNORECASE)
+
+# Para evitar falsos positivos de “IR” en “sIRve”
+RE_WORD_IR = re.compile(r"(?<![A-ZÁÉÍÓÚÜÑa-záéíóúüñ])ir(?![A-ZÁÉÍÓÚÜÑa-záéíóúüñ])", re.IGNORECASE)
 
 
 # =========================
 # HELPERS
 # =========================
 def get_secret(*keys: str) -> Optional[str]:
-    """Lee keys posibles de st.secrets sin romper."""
     for k in keys:
         try:
             v = st.secrets.get(k)
@@ -65,17 +71,15 @@ def get_secret(*keys: str) -> Optional[str]:
 
 
 def configure_gemini() -> Optional[Any]:
-    """Configura Gemini si hay key."""
     if not GEMINI_AVAILABLE:
         return None
 
-    # Acepta cualquiera de estas keys para que no te vuelva a pasar lo del KeyError
+    # Acepta cualquiera de estas (tu error venía de nombre de key)
     api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY")
     if not api_key:
         return None
 
     genai.configure(api_key=api_key)
-    # Flash es más rápido/ barato para esto
     return genai.GenerativeModel("gemini-1.5-flash")
 
 
@@ -89,9 +93,18 @@ def post_json(url: str, payload: Dict[str, Any]) -> Optional[Any]:
     return None
 
 
-@st.cache_data(ttl=60 * 10, show_spinner=False)  # cachea 10 min
+def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    try:
+        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
+    return None
+
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
 def fetch_product_view(product_id: int) -> Optional[Dict[str, Any]]:
-    """Trae ficha oficial por ProductId usando /Products/View."""
     payload = {"ProductId": int(product_id)}
     for base in API_BASES:
         data = post_json(f"{base}/Products/View", payload)
@@ -100,58 +113,10 @@ def fetch_product_view(product_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-@st.cache_data(ttl=60 * 10, show_spinner=False)
-def search_product_by_code(code: str) -> Optional[Dict[str, Any]]:
-    """
-    Busca producto por Code probando endpoints típicos.
-    Si tu backend tiene otro endpoint, igual te queda listo para sumar 1 línea.
-    """
-    code = code.strip().upper()
-
-    # 1) Intento: endpoint tipo Search (muy común)
-    candidates_payloads = [
-        ("Products/Search", {"Query": code}),
-        ("Products/Search", {"Text": code}),
-        ("Products/Search", {"q": code}),
-        ("Products/Find", {"Query": code}),
-        ("Products/FindByCode", {"Code": code}),
-        ("Products/ByCode", {"Code": code}),
-        ("Products/GetByCode", {"Code": code}),
-    ]
-
-    for base in API_BASES:
-        for path, payload in candidates_payloads:
-            data = post_json(f"{base}/{path}", payload)
-
-            # Caso A: devuelve lista
-            if isinstance(data, list) and data:
-                # Match exacto por "Code"
-                for p in data:
-                    if isinstance(p, dict) and str(p.get("Code", "")).upper() == code:
-                        # Si ya trae ProductId, confirmamos con View
-                        pid = p.get("ProductId")
-                        if pid:
-                            full = fetch_product_view(int(pid))
-                            return full or p
-                        return p
-
-            # Caso B: devuelve dict directo
-            if isinstance(data, dict) and data.get("Code"):
-                if str(data.get("Code", "")).upper() == code:
-                    pid = data.get("ProductId")
-                    if pid:
-                        full = fetch_product_view(int(pid))
-                        return full or data
-                    return data
-
-    return None
-
-
 def extract_ids_and_models(text: str) -> Tuple[List[int], List[str]]:
-    """Extrae IDs desde URL y modelos tipo IPC-4M-FA-ZERO."""
     t = text or ""
-    ids = []
-    models = []
+    ids: List[int] = []
+    models: List[str] = []
 
     for m in RE_PRODUCT_URL_ID.findall(t):
         try:
@@ -159,14 +124,10 @@ def extract_ids_and_models(text: str) -> Tuple[List[int], List[str]]:
         except Exception:
             pass
 
-    # Modelos
     for m in RE_MODEL.findall(t):
-        mm = m.upper().strip()
-        # descarta cosas raras tipo "HTTP-200" si aparecieran
-        if len(mm) >= 6 and "-" in mm:
-            models.append(mm)
+        models.append(m.upper().strip())
 
-    # De-dup manteniendo orden
+    # dedup manteniendo orden
     ids = list(dict.fromkeys(ids))
     models = list(dict.fromkeys(models))
     return ids, models
@@ -177,27 +138,23 @@ def safe_str(x: Any) -> str:
 
 
 def summarize_product_for_context(p: Dict[str, Any]) -> str:
-    """Resumen compacto de ficha para meter en el contexto del modelo."""
-    return json.dumps({
-        "ProductId": p.get("ProductId"),
-        "Code": p.get("Code"),
-        "DescriptionShort": p.get("DescriptionShort"),
-        "Price": p.get("Price"),
-        "Stock": p.get("Stock"),
-        "Image": p.get("Image"),
-        "DataSheet": p.get("DataSheet"),
-        "Links": p.get("Links", []),
-        "DescriptionLong": p.get("DescriptionLong"),
-    }, ensure_ascii=False)
+    return json.dumps(
+        {
+            "ProductId": p.get("ProductId"),
+            "Code": p.get("Code"),
+            "DescriptionShort": p.get("DescriptionShort"),
+            "Price": p.get("Price"),
+            "Stock": p.get("Stock"),
+            "DataSheet": p.get("DataSheet"),
+            "DescriptionLong": p.get("DescriptionLong"),
+        },
+        ensure_ascii=False,
+    )
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def extract_pdf_text(pdf_url: str) -> str:
-    """Baja PDF y extrae texto (si pypdf está disponible)."""
-    if not PDF_AVAILABLE:
-        return ""
-
-    if not pdf_url:
+    if not PDF_AVAILABLE or not pdf_url:
         return ""
     try:
         r = requests.get(pdf_url, timeout=HTTP_TIMEOUT)
@@ -219,109 +176,234 @@ def extract_pdf_text(pdf_url: str) -> str:
         return ""
 
 
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def web_search_product_id_by_code(code: str) -> Optional[int]:
+    """
+    Fallback CLAVE: si no hay endpoint por código,
+    scrapea el buscador web para encontrar /products/view/ID.
+    """
+    code = code.strip().upper()
+
+    # Intentos de búsqueda web (cambian según tu sitio, por eso probamos varias)
+    search_paths = [
+        ("/products", {"search": code}),
+        ("/products", {"q": code}),
+        ("/products", {"s": code}),
+        ("/", {"search": code}),
+    ]
+
+    for wb in WEB_BASES:
+        for path, params in search_paths:
+            try:
+                url = wb + path
+                r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+                if r.status_code != 200:
+                    continue
+                html = r.text or ""
+                # buscar link /products/view/#### en el HTML
+                m = re.search(r"/products/view/(\d+)", html, flags=re.IGNORECASE)
+                if m:
+                    return int(m.group(1))
+
+                # si no aparece directo, parseo links (más caro pero más robusto)
+                soup = BeautifulSoup(html, "html.parser")
+                for a in soup.select("a[href]"):
+                    href = a.get("href", "")
+                    mm = re.search(r"/products/view/(\d+)", href, flags=re.IGNORECASE)
+                    if mm:
+                        return int(mm.group(1))
+            except Exception:
+                continue
+
+    return None
+
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def api_search_product_by_code(code: str) -> Optional[Dict[str, Any]]:
+    """
+    Intenta endpoints comunes (GET/POST). Si alguno existe, genial.
+    Si no, devolver None y luego caemos a scraping.
+    """
+    code = code.strip().upper()
+
+    # POST endpoints típicos
+    post_candidates = [
+        ("Products/Search", {"Query": code}),
+        ("Products/Search", {"Text": code}),
+        ("Products/FindByCode", {"Code": code}),
+        ("Products/GetByCode", {"Code": code}),
+        ("Products/ByCode", {"Code": code}),
+    ]
+
+    # GET endpoints típicos
+    get_candidates = [
+        ("Products/Search", {"q": code}),
+        ("Products/Search", {"query": code}),
+        ("Products/GetByCode", {"code": code}),
+        (f"Products/GetByCode/{code}", None),
+        (f"Products/ByCode/{code}", None),
+        (f"Products/Find/{code}", None),
+    ]
+
+    for base in API_BASES:
+        # POST
+        for path, payload in post_candidates:
+            data = post_json(f"{base}/{path}", payload)
+            if isinstance(data, dict) and data.get("Code"):
+                if safe_str(data.get("Code")).upper() == code:
+                    pid = data.get("ProductId")
+                    return fetch_product_view(int(pid)) if pid else data
+            if isinstance(data, list) and data:
+                for item in data:
+                    if isinstance(item, dict) and safe_str(item.get("Code")).upper() == code:
+                        pid = item.get("ProductId")
+                        return fetch_product_view(int(pid)) if pid else item
+
+        # GET
+        for path, params in get_candidates:
+            data = get_json(f"{base}/{path}", params=params)
+            if isinstance(data, dict) and data.get("Code"):
+                if safe_str(data.get("Code")).upper() == code:
+                    pid = data.get("ProductId")
+                    return fetch_product_view(int(pid)) if pid else data
+            if isinstance(data, list) and data:
+                for item in data:
+                    if isinstance(item, dict) and safe_str(item.get("Code")).upper() == code:
+                        pid = item.get("ProductId")
+                        return fetch_product_view(int(pid)) if pid else item
+
+    return None
+
+
+def resolve_products_from_text(text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Resuelve productos mencionados por URL/ID o por Code.
+    Devuelve (products, debug_info)
+    """
+    ids, models = extract_ids_and_models(text)
+
+    debug = {"ids": ids, "models": models, "resolved": []}
+    products: List[Dict[str, Any]] = []
+
+    # 1) IDs directos
+    for pid in ids:
+        p = fetch_product_view(pid)
+        if p:
+            products.append(p)
+            debug["resolved"].append({"via": "id", "pid": pid, "code": p.get("Code")})
+
+    # 2) Codes
+    for code in models:
+        # evita repetir
+        if any(safe_str(p.get("Code")).upper() == code for p in products):
+            continue
+
+        # 2A) intento API
+        p = api_search_product_by_code(code)
+        if p:
+            products.append(p)
+            debug["resolved"].append({"via": "api_code", "code": code, "pid": p.get("ProductId")})
+            continue
+
+        # 2B) fallback scraping web -> obtiene productId -> View
+        pid = web_search_product_id_by_code(code)
+        if pid:
+            p2 = fetch_product_view(pid)
+            if p2:
+                products.append(p2)
+                debug["resolved"].append({"via": "web_scrape", "code": code, "pid": pid, "real_code": p2.get("Code")})
+
+    # de-dup
+    uniq = []
+    seen = set()
+    for p in products:
+        key = (safe_str(p.get("ProductId")), safe_str(p.get("Code")).upper())
+        if key not in seen:
+            uniq.append(p)
+            seen.add(key)
+
+    return uniq, debug
+
+
 def infer_basic_answers(question: str, products: List[Dict[str, Any]]) -> str:
     """
-    Respuesta “modo vendedor” sin IA: usa ficha y reglas.
-    (Sirve como fallback si no hay Gemini o si falla.)
+    Respuesta sin IA: usa ficha + reglas simples.
+    (Importante: NO usar 'ir' substring, usa regex de palabra)
     """
     q = (question or "").lower()
 
     if not products:
-        return "No pude identificar productos en tu consulta. Pasame el/los modelos exactos o una URL de producto (ej: bigdipper.com.ar/products/view/6964)."
+        return (
+            "No pude identificar productos en tu consulta.\n\n"
+            "👉 Pasame el/los **modelos exactos** (ej: `IPC-4M-FA-ZERO`) o una URL `bigdipper.com.ar/products/view/####`."
+        )
 
-    lines = []
+    out = []
     for p in products:
         code = safe_str(p.get("Code")).upper()
         longd = safe_str(p.get("DescriptionLong"))
         shortd = safe_str(p.get("DescriptionShort"))
-        lines.append(f"**{code}** — {shortd}".strip(" —"))
+        out.append(f"**{code}** — {shortd}".strip(" —"))
 
-        # Exterior: si tiene IP67 / IP66 en descripción
+        # Exterior
         if "exterior" in q or "afuera" in q:
-            if re.search(r"\bIP6[6-9]\b", longd, re.IGNORECASE):
-                ip = re.search(r"\bIP6[6-9]\b", longd, re.IGNORECASE).group(0)
-                lines.append(f"• **Uso exterior:** Sí. La ficha indica protección **{ip}**.")
+            ipm = re.search(r"\bIP6[6-9]\b", longd, re.IGNORECASE)
+            if ipm:
+                out.append(f"• **Uso exterior:** Sí. La ficha indica **{ipm.group(0)}**.")
             else:
-                lines.append("• **Uso exterior:** No lo puedo confirmar con la ficha visible (no aparece IP66/IP67).")
+                out.append("• **Uso exterior:** No lo puedo confirmar con la ficha (no veo IP66/IP67).")
 
-        # Alimentación: PoE / 12V / 24V
-        if "aliment" in q or "poe" in q or "fuente" in q or "volt" in q:
+        # Alimentación
+        if ("aliment" in q) or ("poe" in q) or ("fuente" in q) or ("volt" in q):
             if re.search(r"\bpoe\b", longd, re.IGNORECASE):
-                lines.append("• **Alimentación:** Compatible con **PoE** (según ficha).")
+                out.append("• **Alimentación:** Compatible con **PoE** (según ficha).")
             elif re.search(r"\b12\s*v\b", longd, re.IGNORECASE):
-                lines.append("• **Alimentación:** La ficha menciona **12V**.")
+                out.append("• **Alimentación:** La ficha menciona **12V**.")
             elif re.search(r"\b24\s*v\b", longd, re.IGNORECASE):
-                lines.append("• **Alimentación:** La ficha menciona **24V**.")
+                out.append("• **Alimentación:** La ficha menciona **24V**.")
             else:
-                lines.append("• **Alimentación:** No figura explícito en la ficha que tengo acá.")
+                out.append("• **Alimentación:** No figura explícito en la ficha.")
 
-        # IR / luz
-        if "ir" in q or "infrarro" in q or "noche" in q or "oscur" in q:
+        # IR / visión nocturna (FIX: solo IR como palabra)
+        if ("vision noct" in q) or ("infrarro" in q) or RE_WORD_IR.search(q) or ("noche" in q):
             if re.search(r"\bir\b|infrarro", longd, re.IGNORECASE):
-                lines.append("• **Visión nocturna:** La ficha menciona **IR / infrarrojo**.")
+                out.append("• **Visión nocturna:** La ficha menciona **IR / infrarrojo**.")
             elif re.search(r"luz blanca", longd, re.IGNORECASE):
-                # tu ejemplo de cámara Zero habla de luz blanca
-                lines.append("• **Visión nocturna:** No usa IR clásico; la ficha indica **luz blanca** para color (hasta la distancia indicada).")
+                out.append("• **Visión nocturna:** La ficha indica **luz blanca** (color) y especifica distancia.")
             else:
-                lines.append("• **Visión nocturna:** No lo puedo confirmar con la ficha.")
+                out.append("• **Visión nocturna:** No lo puedo confirmar con la ficha.")
 
-    # Compatibilidad (si hay 2 modelos en la pregunta)
-    if len(products) >= 2 and ("compat" in q or "funciona con" in q or "sirve con" in q or "xvr" in q or "nvr" in q):
-        codes = [safe_str(p.get("Code")).upper() for p in products]
-        lines.append("\n**Compatibilidad (criterio práctico):**")
-        # reglas simples por prefijo
-        cam = None
-        rec = None
-        for c in codes:
-            if c.startswith("IPC") or c.startswith("NVC") or c.startswith("NVR"):
-                cam = cam or c
-            if c.startswith("XVR") or c.startswith("DVR") or c.startswith("NVR"):
-                rec = rec or c
-
-        # Si parece cámara IP con XVR: depende si el XVR soporta canales IP/ONVIF
-        if any(c.startswith("IPC") for c in codes) and any(c.startswith("XVR") for c in codes):
-            lines.append("• **IPC (IP) + XVR:** depende de que el XVR sea **híbrido con canales IP** y soporte **ONVIF/RTSP**. Si el XVR es solo analógico, no.")
-        else:
-            lines.append("• Para confirmarlo 100%, necesito ver en la ficha del grabador cuántos **canales IP** soporta y si dice **ONVIF/RTSP**.")
-
-    return "\n".join(lines).strip()
+    return "\n".join(out).strip()
 
 
 def build_gemini_prompt(question: str, products: List[Dict[str, Any]], pdf_texts: Dict[str, str]) -> str:
-    """
-    Prompt “modo vendedor” bien estricto:
-    - Solo afirmar lo que esté en la ficha/PDF
-    - Si falta algo, decir que no figura
-    - Dar respuesta accionable para vender (pero sin chamuyo)
-    """
-    prod_blocks = []
+    blocks = []
     for p in products:
         code = safe_str(p.get("Code")).upper()
-        prod_blocks.append(f"FICHA_JSON_{code}:\n{summarize_product_for_context(p)}\n")
-        pdf = pdf_texts.get(code, "")
-        if pdf:
-            prod_blocks.append(f"DATASHEET_TEXTO_{code}:\n{pdf}\n")
+        blocks.append(f"FICHA_JSON_{code}:\n{summarize_product_for_context(p)}\n")
+        if pdf_texts.get(code):
+            blocks.append(f"DATASHEET_TEXTO_{code}:\n{pdf_texts[code]}\n")
 
-    context = "\n".join(prod_blocks)
+    context = "\n".join(blocks)
 
     return f"""
 Sos un asistente técnico-comercial para vendedores (Argentina, español rioplatense).
-Tu trabajo: responder consultas técnicas usando SOLO la info provista en FICHA_JSON / DATASHEET_TEXTO.
-Reglas:
-- No inventes compatibilidades. Si no está, decí “no figura en la ficha/datasheet”.
-- Si te preguntan “sirve para X” (ej: boliche), respondé con criterio técnico basado en la ficha (potencia, IP, tipo, etc.) y aclarando límites.
-- Respuesta corta, clara, con viñetas. Siempre incluir “Qué confirmaría” si falta un dato.
+Respondé SOLO con lo que puedas justificar con FICHA_JSON / DATASHEET_TEXTO.
+Si falta un dato, decí “no figura en la ficha/datasheet” y sugerí qué dato confirmar.
 
-CONSULTA DEL VENDEDOR:
+Formato:
+- Respuesta corta, clara, con viñetas.
+- Si preguntan compatibilidad (ej cámara con XVR), explicá condición (ONVIF/RTSP/canales IP, etc.) y qué revisar.
+
+CONSULTA:
 {question}
 
-INFO OFICIAL DISPONIBLE:
+INFO OFICIAL:
 {context}
 """.strip()
 
 
 def answer_with_gemini(model, question: str, products: List[Dict[str, Any]]) -> str:
-    """Usa Gemini si está disponible; si falla, cae al modo reglas."""
     if not model:
         return infer_basic_answers(question, products)
 
@@ -336,116 +418,76 @@ def answer_with_gemini(model, question: str, products: List[Dict[str, Any]]) -> 
 
     try:
         resp = model.generate_content(prompt)
-        text = getattr(resp, "text", None) or ""
-        text = text.strip()
-        if not text:
-            return infer_basic_answers(question, products)
-        return text
+        txt = (getattr(resp, "text", "") or "").strip()
+        return txt if txt else infer_basic_answers(question, products)
     except Exception:
         return infer_basic_answers(question, products)
-
-
-def resolve_products_from_text(text: str) -> List[Dict[str, Any]]:
-    """Resuelve productos mencionados por URL/ID o por código."""
-    ids, models = extract_ids_and_models(text)
-
-    products: List[Dict[str, Any]] = []
-
-    # 1) Por IDs (URL)
-    for pid in ids:
-        p = fetch_product_view(pid)
-        if p:
-            products.append(p)
-
-    # 2) Por modelos (code)
-    for code in models:
-        # si ya lo tenemos por ID, no repetir
-        if any(safe_str(p.get("Code")).upper() == code for p in products):
-            continue
-        p = search_product_by_code(code)
-        if p:
-            products.append(p)
-
-    # de-dup por ProductId/Code
-    uniq = []
-    seen = set()
-    for p in products:
-        key = (safe_str(p.get("ProductId")), safe_str(p.get("Code")).upper())
-        if key not in seen:
-            uniq.append(p)
-            seen.add(key)
-    return uniq
 
 
 # =========================
 # UI
 # =========================
 st.title("🤖 Asistente de Ventas Big Dipper")
-st.caption("Escribí como lo haría un vendedor (incluí modelos si los tenés). Ej: “¿La IPC-4M-FA-ZERO sirve para exterior y con qué grabador funciona?”")
+st.caption("Escribí como lo haría un vendedor. Podés mezclar modelo + consulta en una sola frase.")
 
 gemini_model = configure_gemini()
 
-# Session state chat
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "last_products" not in st.session_state:
-    st.session_state.last_products = []  # cache de productos del último turno
+    st.session_state.last_products = []
+if "show_debug" not in st.session_state:
+    st.session_state.show_debug = False
 
+# Toggle debug (para que puedas ver qué detecta)
+with st.sidebar:
+    st.session_state.show_debug = st.toggle("Mostrar debug (detector de modelos/IDs)", value=st.session_state.show_debug)
+    st.markdown("**Secrets**: si usás Gemini, cargá `GEMINI_API_KEY` o `GOOGLE_API_KEY` en Streamlit Cloud.")
 
-# Render historial
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-
 user_text = st.chat_input("Tu consulta…")
 if user_text:
-    # User msg
     st.session_state.messages.append({"role": "user", "content": user_text})
     with st.chat_message("user"):
         st.markdown(user_text)
 
     with st.chat_message("assistant"):
-        with st.spinner("Analizando ficha oficial…"):
-            products = resolve_products_from_text(user_text)
+        with st.spinner("Buscando ficha oficial…"):
+            products, debug = resolve_products_from_text(user_text)
 
-            # Si no encontró productos en esta pregunta, pero venimos de uno anterior,
-            # usamos “memoria corta” de sesión: ayuda a que sea conversacional.
+            # Conversacional: si no detecta nada en este turno, usa los últimos productos si existían
             if not products and st.session_state.last_products:
                 products = st.session_state.last_products
 
-            # Guardar para el próximo turno
+            # Actualiza memoria corta
             if products:
                 st.session_state.last_products = products
 
-            # Si sigue sin productos: pedir modelo o URL
             if not products:
                 reply = (
                     "No pude identificar productos en tu consulta.\n\n"
-                    "👉 Pegame el/los **modelos exactos** (ej: `IPC-4M-FA-ZERO`) **o** una URL tipo "
-                    "`bigdipper.com.ar/products/view/6964`.\n\n"
-                    "Tip: también sirve si pegás el JSON de la ficha, como hiciste antes."
+                    "👉 Pasame el/los **modelos exactos** (ej: `IPC-4M-FA-ZERO`) o una URL `bigdipper.com.ar/products/view/####`.\n"
+                    "Si el modelo existe pero no lo engancho, activá **debug** y veo qué está detectando."
                 )
                 st.markdown(reply)
                 st.session_state.messages.append({"role": "assistant", "content": reply})
             else:
                 reply = answer_with_gemini(gemini_model, user_text, products)
-
-                # Bloque opcional: “evidencia” rápida para vendedores (sin ensuciar demasiado)
-                # Si querés sacarlo, borrá este bloque.
-                evid = []
-                for p in products:
-                    code = safe_str(p.get("Code")).upper()
-                    shortd = safe_str(p.get("DescriptionShort"))
-                    stock = p.get("Stock")
-                    ds = safe_str(p.get("DataSheet"))
-                    evid.append(f"- **{code}**: {shortd} | Stock: {stock} | Datasheet: {ds if ds else '—'}")
-
                 st.markdown(reply)
+
+                # Evidencia
                 with st.expander("Ver datos oficiales usados (ficha)"):
-                    st.markdown("\n".join(evid))
+                    for p in products:
+                        code = safe_str(p.get("Code")).upper()
+                        st.markdown(
+                            f"- **{code}** | Stock: {p.get('Stock')} | Datasheet: {safe_str(p.get('DataSheet')) or '—'}"
+                        )
+
+                if st.session_state.show_debug:
+                    with st.expander("Debug: qué detectó / cómo resolvió"):
+                        st.json(debug)
 
                 st.session_state.messages.append({"role": "assistant", "content": reply})
-
-
-
