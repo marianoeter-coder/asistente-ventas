@@ -63,7 +63,7 @@ if p := st.chat_input("Consulta técnica..."):
             with st.spinner("Leyendo manual..."):
                 txt = leer_web(url)
                 if txt:
-                    model = genai.GenerativeModel('gemini-pro')
+                   model = genai.GenerativeModel('gemini-1.5-flash')
                     prompt = f"Responde usando SOLO este texto web:\n\n{txt}\n\nPregunta: {p}"
                     res = model.generate_content(prompt)
                     st.markdown(res.text)
