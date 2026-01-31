@@ -1,73 +1,101 @@
 import streamlit as st
 import google.generativeai as genai
 import requests
-import re
-import pdfplumber
-import io
 
-# =========================
-# CONFIG
-# =========================
-st.set_page_config(page_title="Asistente de Ventas Big Dipper", page_icon="🤖")
-st.title("🤖 Asistente de Ventas Big Dipper")
+# ================= CONFIG =================
 
-# =========================
-# API KEY
-# =========================
+st.set_page_config(page_title="Asistente Big Dipper", page_icon="🤖")
+
+# ================= SEGURIDAD =================
+
+if "acceso" not in st.session_state:
+    st.session_state.acceso = False
+
+def login():
+    st.title("🔒 Acceso Interno Big Dipper")
+    clave = st.text_input("Contraseña", type="password")
+    if st.button("Entrar"):
+        if clave == "Ventas2025":
+            st.session_state.acceso = True
+            st.rerun()
+        else:
+            st.error("Clave incorrecta")
+
+if not st.session_state.acceso:
+    login()
+    st.stop()
+
+# ================= GEMINI =================
+
 try:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 except:
-    st.error("Falta configurar GOOGLE_API_KEY en secrets.")
+    st.error("Falta GOOGLE_API_KEY en Streamlit Secrets")
     st.stop()
 
-# =========================
-# BIG DIPPER API
-# =========================
-SEARCH_API = "https://www.bigdipper.com.ar/api/Products/Search"
-VIEW_API = "https://www.bigdipper.com.ar/api/Products/View"
+model = genai.GenerativeModel("gemini-pro")
 
-# =========================
-# MODELO DETECTOR
-# =========================
-def extract_models(text):
-    pattern = r'[A-Z]{2,10}(?:-[A-Z0-9]+){1,6}'
-    return list(set(re.findall(pattern, text.upper())))
+# ================= FUNCIONES BIG DIPPER =================
 
-# =========================
-# BUSCAR PRODUCTO
-# =========================
-def get_product(model_code):
+def buscar_producto_por_codigo(code):
     try:
-        r = requests.post(SEARCH_API, json={"Text": model_code}, timeout=10)
+        r = requests.post(
+            "https://www.bigdipper.com.ar/api/Products/FindByCode",
+            json={"Code": code},
+            timeout=10
+        )
         data = r.json()
-
-        if "Items" not in data or len(data["Items"]) == 0:
+        if "ProductId" not in data:
             return None
+        return data["ProductId"]
+    except:
+        return None
 
-        product_id = data["Items"][0]["ProductId"]
-
-        r = requests.post(VIEW_API, json={"ProductId": product_id}, timeout=10)
+def obtener_producto(product_id):
+    try:
+        r = requests.post(
+            "https://www.bigdipper.com.ar/api/Products/View",
+            json={"ProductId": product_id},
+            timeout=10
+        )
         return r.json()
     except:
         return None
 
-# =========================
-# LEER PDF
-# =========================
-def read_pdf(url):
-    try:
-        r = requests.get(url, timeout=10)
-        with pdfplumber.open(io.BytesIO(r.content)) as pdf:
-            text = ""
-            for page in pdf.pages:
-                text += page.extract_text() + "\n"
-        return text[:35000]
-    except:
-        return ""
+# ================= IA =================
 
-# =========================
-# CHAT
-# =========================
+def responder_ventas(pregunta, productos):
+    contexto = ""
+
+    for p in productos:
+        contexto += f"""
+Producto: {p['Code']} - {p['DescriptionShort']}
+Stock: {p['Stock']}
+Descripción técnica:
+{p['DescriptionLong']}
+---
+"""
+
+    prompt = f"""
+Sos un asistente técnico de ventas de Big Dipper.
+
+Respondé SOLO usando estos datos oficiales:
+{contexto}
+
+Si algo no está explícitamente en los datos:
+→ Inferilo técnicamente como un vendedor experto.
+→ NO respondas "no figura en la ficha".
+
+Pregunta del vendedor:
+{pregunta}
+"""
+
+    return model.generate_content(prompt).text
+
+# ================= UI =================
+
+st.title("🤖 Asistente de Ventas Big Dipper")
+
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
@@ -75,59 +103,36 @@ for m in st.session_state.chat:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# =========================
-# INPUT
-# =========================
-question = st.chat_input("Escribí tu consulta (ej: ¿La IPC-4M-FA-ZERO sirve para exterior y con qué XVR funciona?)")
+consulta = st.chat_input("Ej: ¿La IPC-4M-FA-ZERO sirve para exterior y con qué XVR funciona?")
 
-if question:
-    st.session_state.chat.append({"role":"user","content":question})
+if consulta:
+    st.session_state.chat.append({"role":"user","content":consulta})
     with st.chat_message("user"):
-        st.markdown(question)
+        st.markdown(consulta)
 
     with st.chat_message("assistant"):
-        with st.spinner("Analizando productos Big Dipper..."):
+        with st.spinner("Buscando productos Big Dipper..."):
 
-            models = extract_models(question)
+            # Extraer modelos de la consulta
+            palabras = consulta.replace("?", "").replace(",", "").split()
+            modelos = [p for p in palabras if "-" in p and len(p) > 5]
 
-            if not models:
-                st.error("No se detectaron modelos en la consulta.")
-                st.stop()
+            productos = []
 
-            context = ""
+            for m in modelos:
+                pid = buscar_producto_por_codigo(m)
+                if pid:
+                    prod = obtener_producto(pid)
+                    if prod:
+                        productos.append(prod)
 
-            for model in models:
-                product = get_product(model)
-                if not product:
-                    continue
-
-                context += f"\n\nMODELO: {model}\n"
-                context += product.get("DescriptionLong","") + "\n"
-
-                if product.get("DataSheet"):
-                    pdf_text = read_pdf(product["DataSheet"])
-                    context += "\nDATASHEET:\n" + pdf_text
-
-            if not context:
+            if not productos:
                 st.error("No encontré esos modelos en Big Dipper.")
-                st.stop()
+            else:
+                respuesta = responder_ventas(consulta, productos)
+                st.markdown(respuesta)
+                st.session_state.chat.append({"role":"assistant","content":respuesta})
 
-            prompt = f"""
-Sos un asesor técnico y comercial de Big Dipper.
-Respondé de forma clara, útil y profesional.
-Usá SOLO la información siguiente.
-
-{context}
-
-Pregunta:
-{question}
-"""
-
-            model = genai.GenerativeModel("gemini-1.5-pro")
-            res = model.generate_content(prompt)
-
-            st.markdown(res.text)
-            st.session_state.chat.append({"role":"assistant","content":res.text})
 
 
 
